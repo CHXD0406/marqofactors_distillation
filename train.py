@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
+"""Train EN-QFormer-DE product factor model.
 
+Launch examples:
+
+Single GPU:
+    python train.py
+
+DDP with selected GPUs:
+    CUDA_VISIBLE_DEVICES=3 torchrun --nproc_per_node=1 train.py
+
+This script keeps all hard-coded project paths in `Config`, supports early
+stopping on test loss, best/latest checkpointing, and resume training. In DDP,
+every rank owns one full copy of frozen DINO + frozen RoBERTa + trainable
+Q-Former/decoder on its local GPU.
+"""
 
 from __future__ import annotations
 
