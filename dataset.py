@@ -1,563 +1,436 @@
 #!/usr/bin/env python3
-"""Dataset utilities for multimodal product factor generation.
-
-Expected data layout:
-
-    Attribution/dataset/
-      train.json
-      test.json
-      train/{index}.jpg
-      test/{index}.jpg
-      train_map/{index}.pt
-      test_map/{index}.pt
-
-Each JSON record should contain at least `index`, `title`, `image`, and
-`pkuseg_factors`. `factors` is used as the autoregressive decoder target when
-available. Qwen selected-head maps are loaded from `{split}_map/{index}.pt` and
-resized in the collate function to match the DINO 518px grid, i.e. 37x37 for
-patch size 14.
-
-The dataset deliberately does not load DINO/RoBERTa/decoder models. It only
-loads images, raw text fields, and compact teacher maps.
-"""
 
 from __future__ import annotations
 
 import json
+import math
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
-import numpy as np
 import torch
 import torch.nn.functional as F
-from PIL import Image
-from torch.utils.data import Dataset
+from torch import nn
+from transformers import AutoModel, AutoTokenizer, PreTrainedTokenizerBase
 
-SplitName = Literal["train", "test"]
-
-DEFAULT_DATASET_ROOT = Path("/mnt/disk5/syh_flowwif2/Attribution/dataset")
-DINO_IMAGE_SIZE = 518
-DINO_PATCH_SIZE = 14
-DINO_GRID_SIZE = DINO_IMAGE_SIZE // DINO_PATCH_SIZE  # 37
-IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406], dtype=torch.float32).view(3, 1, 1)
-IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225], dtype=torch.float32).view(3, 1, 1)
+DEFAULT_DECODER_TOKENIZER_PATH = Path("/mnt/disk5/syh_flowwif2/Attribution/model_factors/decoder_tokenizer")
+DEFAULT_ROBERTA_PATH = Path("/mnt/disk5/syh_flowwif2/Attribution/model_factors/chinese-roberta-wwm-ext")
 
 
-def load_factor_records(json_path: str | Path) -> list[dict[str, Any]]:
-    """Load records from a train/test JSON file."""
-    path = Path(json_path).expanduser().resolve()
-    with path.open("r", encoding="utf-8") as f:
-        payload = json.load(f)
-
-    if isinstance(payload, dict) and "records" in payload:
-        records = payload["records"]
-    elif isinstance(payload, list):
-        records = payload
-    else:
-        raise ValueError(f"Unsupported dataset JSON structure: {path}")
-
-    if not isinstance(records, list):
-        raise ValueError(f"records must be a list in {path}")
-    return [record for record in records if isinstance(record, dict)]
+@dataclass
+class FactorDecoderBatch:
+    input_ids: torch.Tensor
+    attention_mask: torch.Tensor
+    labels: torch.Tensor
+    target_text: list[str]
 
 
-def clean_factor_list(value: Any) -> list[str]:
-    """Normalize factors only enough for training safety, without changing content."""
-    if not isinstance(value, list):
-        return []
-    factors: list[str] = []
-    seen: set[str] = set()
-    for item in value:
-        factor = str(item or "").strip()
-        if not factor:
-            continue
-        key = factor.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        factors.append(factor)
-    return factors
+@dataclass
+class FactorDecoderOutput:
+    logits: torch.Tensor
+    loss: torch.Tensor | None
+    hidden_states: torch.Tensor
+    cross_attentions: tuple[torch.Tensor, ...]
 
 
-def factors_to_text(factors: list[str], output_format: str = "json_array") -> str:
-    """Convert factor list to the text target consumed by the decoder."""
-    if output_format == "json_array":
-        return json.dumps(factors, ensure_ascii=False, separators=(",", ":"))
-    if output_format == "newline":
-        return "\n".join(factors)
-    if output_format == "semicolon":
-        return "; ".join(factors)
-    raise ValueError(f"Unsupported output_format: {output_format}")
+class SinusoidalPositionalEncoding(nn.Module):
+    """Deterministic positional encoding to avoid tokenizer/model coupling."""
+
+    def __init__(self, hidden_dim: int, max_position_embeddings: int = 512) -> None:
+        super().__init__()
+        position = torch.arange(max_position_embeddings, dtype=torch.float32).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, hidden_dim, 2, dtype=torch.float32) * (-math.log(10000.0) / hidden_dim))
+        pe = torch.zeros(max_position_embeddings, hidden_dim, dtype=torch.float32)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)
+
+    def forward(self, x: torch.Tensor, position_offset: int = 0) -> torch.Tensor:
+        seq_len = x.size(1)
+        end = int(position_offset) + seq_len
+        if end > self.pe.size(1):
+            raise ValueError(f"Position end {end} exceeds max positional length {self.pe.size(1)}")
+        return x + self.pe[:, position_offset:end].to(dtype=x.dtype, device=x.device)
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        if value is None or value == "":
-            return default
-        return int(round(float(value)))
-    except (TypeError, ValueError):
-        return default
-
-
-def _resolve_image_path(record: dict[str, Any], image_root: Path) -> Path:
-    """Resolve image path from record fields, falling back to index-based names."""
-    image_value = str(record.get("image", "") or "").strip()
-    if image_value:
-        image_path = image_root / image_value
-        if image_path.exists():
-            return image_path
-
-    index = _safe_int(record.get("index"), -1)
-    if index >= 0:
-        for suffix in (".jpg", ".jpeg", ".png", ".webp", ".bmp"):
-            image_path = image_root / f"{index}{suffix}"
-            if image_path.exists():
-                return image_path
-
-    if image_value:
-        return image_root / image_value
-    return image_root / f"{index}.jpg"
-
-
-def _resolve_map_path(record: dict[str, Any], map_root: Path) -> Path:
-    index = _safe_int(record.get("index"), -1)
-    return map_root / f"{index}.pt"
-
-
-def letterbox_resize_to_tensor(
-    image: Image.Image,
-    image_size: int = DINO_IMAGE_SIZE,
-    fill: tuple[int, int, int] = (255, 255, 255),
-    normalize: bool = True,
-) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Resize with aspect ratio preserved, pad to square, and return CHW tensor.
-
-    The returned tensor is ImageNet-normalized by default for DINOv2. Metadata
-    includes the original size, resized content size, and content box in the
-    padded square, which is useful for later map/box alignment if needed.
-    """
-    image = image.convert("RGB")
-    orig_w, orig_h = image.size
-    scale = min(float(image_size) / max(orig_w, 1), float(image_size) / max(orig_h, 1))
-    new_w = max(1, int(round(orig_w * scale)))
-    new_h = max(1, int(round(orig_h * scale)))
-    resized = image.resize((new_w, new_h), Image.Resampling.BICUBIC)
-    canvas = Image.new("RGB", (image_size, image_size), fill)
-    pad_left = (image_size - new_w) // 2
-    pad_top = (image_size - new_h) // 2
-    canvas.paste(resized, (pad_left, pad_top))
-
-    arr = np.asarray(canvas, dtype=np.float32) / 255.0
-    tensor = torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-    if normalize:
-        tensor = (tensor - IMAGENET_MEAN) / IMAGENET_STD
-
-    meta = {
-        "original_size": [orig_w, orig_h],
-        "resized_size": [new_w, new_h],
-        "image_size": image_size,
-        "scale": scale,
-        "pad_left": pad_left,
-        "pad_top": pad_top,
-        "content_box_xyxy": [pad_left, pad_top, pad_left + new_w, pad_top + new_h],
-    }
-    return tensor, meta
-
-
-class ProductFactorMapDataset(Dataset):
-    """Split-aware dataset for product factor generation with Qwen map targets.
-
-    Only `dataset_root` and `split` are needed. Paths are inferred as:
-    - `{dataset_root}/{split}.json`
-    - `{dataset_root}/{split}` for images
-    - `{dataset_root}/{split}_map` for teacher maps
-
-    Samples are kept only when required fields, image file, and map file exist.
-    """
+class FactorDecoderBlock(nn.Module):
+    """Pre-norm Transformer decoder block."""
 
     def __init__(
         self,
-        dataset_root: str | Path = DEFAULT_DATASET_ROOT,
-        split: SplitName = "train",
-        image_size: int = DINO_IMAGE_SIZE,
-        output_format: str = "json_array",
-        require_pkuseg_factors: bool = True,
-        require_target_factors: bool = True,
-        require_map: bool = True,
-        max_pkuseg_factors: int | None = None,
-        normalize_image: bool = True,
+        hidden_dim: int = 768,
+        num_heads: int = 12,
+        ffn_dim: int = 3072,
+        dropout: float = 0.1,
     ) -> None:
-        if split not in {"train", "test"}:
-            raise ValueError(f"split must be 'train' or 'test', got {split!r}")
-        self.dataset_root = Path(dataset_root).expanduser().resolve()
-        self.split: SplitName = split
-        self.json_path = self.dataset_root / f"{split}.json"
-        self.image_root = self.dataset_root / split
-        self.map_root = self.dataset_root / f"{split}_map"
-        self.image_size = int(image_size)
-        self.output_format = output_format
-        self.require_pkuseg_factors = bool(require_pkuseg_factors)
-        self.require_target_factors = bool(require_target_factors)
-        self.require_map = bool(require_map)
-        self.max_pkuseg_factors = max_pkuseg_factors
-        self.normalize_image = bool(normalize_image)
+        super().__init__()
+        self.self_attn_norm = nn.LayerNorm(hidden_dim)
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.cross_attn_norm = nn.LayerNorm(hidden_dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn_norm = nn.LayerNorm(hidden_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(hidden_dim, ffn_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(ffn_dim, hidden_dim),
+            nn.Dropout(dropout),
+        )
 
-        records = load_factor_records(self.json_path)
-        self.records: list[dict[str, Any]] = []
-        self.image_paths: list[Path] = []
-        self.map_paths: list[Path] = []
-        self.filtered_counts = {
-            "missing_pkuseg_factors": 0,
-            "missing_target_factors": 0,
-            "missing_image": 0,
-            "missing_map": 0,
-        }
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_memory: torch.Tensor,
+        causal_mask: torch.Tensor | None,
+        target_key_padding_mask: torch.Tensor | None = None,
+        encoder_key_padding_mask: torch.Tensor | None = None,
+        need_cross_weights: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        x = self.self_attn_norm(hidden_states)
+        self_out, _ = self.self_attn(
+            query=x,
+            key=x,
+            value=x,
+            attn_mask=causal_mask,
+            key_padding_mask=target_key_padding_mask,
+            need_weights=False,
+        )
+        hidden_states = hidden_states + self_out
 
-        for record in records:
-            pkuseg_factors = clean_factor_list(record.get("pkuseg_factors"))
-            target_factors = clean_factor_list(record.get("factors"))
-            if self.require_pkuseg_factors and not pkuseg_factors:
-                self.filtered_counts["missing_pkuseg_factors"] += 1
-                continue
-            if self.require_target_factors and not target_factors:
-                self.filtered_counts["missing_target_factors"] += 1
-                continue
+        x = self.cross_attn_norm(hidden_states)
+        cross_out, cross_weights = self.cross_attn(
+            query=x,
+            key=encoder_memory,
+            value=encoder_memory,
+            key_padding_mask=encoder_key_padding_mask,
+            need_weights=need_cross_weights,
+            average_attn_weights=False,
+        )
+        hidden_states = hidden_states + cross_out
+        hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
+        return hidden_states, cross_weights
 
-            image_path = _resolve_image_path(record, self.image_root)
-            if not image_path.exists():
-                self.filtered_counts["missing_image"] += 1
-                continue
+    def forward_step(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_memory: torch.Tensor,
+        past_key_value: tuple[torch.Tensor, torch.Tensor] | None = None,
+        encoder_key_padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        x = self.self_attn_norm(hidden_states)
+        if past_key_value is None:
+            key = value = x
+        else:
+            past_key, past_value = past_key_value
+            key = torch.cat([past_key, x], dim=1)
+            value = torch.cat([past_value, x], dim=1)
+        self_out, _ = self.self_attn(
+            query=x,
+            key=key,
+            value=value,
+            attn_mask=None,
+            key_padding_mask=None,
+            need_weights=False,
+        )
+        hidden_states = hidden_states + self_out
 
-            map_path = _resolve_map_path(record, self.map_root)
-            if self.require_map and not map_path.exists():
-                self.filtered_counts["missing_map"] += 1
-                continue
+        y = self.cross_attn_norm(hidden_states)
+        cross_out, _ = self.cross_attn(
+            query=y,
+            key=encoder_memory,
+            value=encoder_memory,
+            key_padding_mask=encoder_key_padding_mask,
+            need_weights=False,
+        )
+        hidden_states = hidden_states + cross_out
+        hidden_states = hidden_states + self.ffn(self.ffn_norm(hidden_states))
+        return hidden_states, (key, value)
 
-            self.records.append(record)
-            self.image_paths.append(image_path)
-            self.map_paths.append(map_path)
 
-        if not self.records:
-            raise ValueError(
-                f"No usable records loaded from {self.json_path}; "
-                f"filtered_counts={self.filtered_counts}"
+class FactorAutoregressiveDecoder(nn.Module):
+    """12-layer AR decoder cross-attending Q-Former memory."""
+
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_dim: int = 768,
+        num_layers: int = 12,
+        num_heads: int = 12,
+        ffn_dim: int = 3072,
+        dropout: float = 0.1,
+        max_position_embeddings: int = 512,
+        pad_token_id: int = 0,
+        tie_embedding: bool = True,
+    ) -> None:
+        super().__init__()
+        self.vocab_size = int(vocab_size)
+        self.hidden_dim = int(hidden_dim)
+        self.pad_token_id = int(pad_token_id)
+        self.token_embedding = nn.Embedding(vocab_size, hidden_dim, padding_idx=pad_token_id)
+        self.position_encoding = SinusoidalPositionalEncoding(hidden_dim, max_position_embeddings)
+        self.dropout = nn.Dropout(dropout)
+        self.layers = nn.ModuleList(
+            FactorDecoderBlock(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                ffn_dim=ffn_dim,
+                dropout=dropout,
             )
-        print(
-            f"Loaded {split} dataset: {len(self.records)} samples "
-            f"from {self.json_path} | filtered={self.filtered_counts}"
+            for _ in range(num_layers)
+        )
+        self.final_norm = nn.LayerNorm(hidden_dim)
+        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+        if tie_embedding:
+            self.lm_head.weight = self.token_embedding.weight
+        self._reset_parameters()
+
+    def _reset_parameters(self) -> None:
+        nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        if self.pad_token_id is not None:
+            with torch.no_grad():
+                self.token_embedding.weight[self.pad_token_id].zero_()
+
+    @staticmethod
+    def build_causal_mask(seq_len: int, device: torch.device) -> torch.Tensor:
+        return torch.triu(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool), diagonal=1)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        encoder_memory: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        encoder_attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor | None = None,
+        return_cross_attentions: bool = False,
+    ) -> FactorDecoderOutput:
+        if input_ids.ndim != 2:
+            raise ValueError(f"input_ids must be [B,L], got {tuple(input_ids.shape)}")
+        if encoder_memory.ndim != 3:
+            raise ValueError(f"encoder_memory must be [B,M,D], got {tuple(encoder_memory.shape)}")
+        if encoder_memory.shape[0] != input_ids.shape[0]:
+            raise ValueError("encoder_memory batch size must match input_ids")
+        if encoder_memory.shape[-1] != self.hidden_dim:
+            raise ValueError(f"encoder_memory hidden dim must be {self.hidden_dim}, got {encoder_memory.shape[-1]}")
+
+        target_key_padding_mask = None
+        if attention_mask is not None:
+            target_key_padding_mask = ~attention_mask.bool()
+        encoder_key_padding_mask = None
+        if encoder_attention_mask is not None:
+            encoder_key_padding_mask = ~encoder_attention_mask.bool()
+
+        hidden_states = self.token_embedding(input_ids)
+        hidden_states = self.position_encoding(hidden_states)
+        hidden_states = self.dropout(hidden_states)
+        causal_mask = self.build_causal_mask(input_ids.size(1), input_ids.device)
+
+        cross_attentions: list[torch.Tensor] = []
+        for layer in self.layers:
+            hidden_states, cross_weights = layer(
+                hidden_states=hidden_states,
+                encoder_memory=encoder_memory,
+                causal_mask=causal_mask,
+                target_key_padding_mask=target_key_padding_mask,
+                encoder_key_padding_mask=encoder_key_padding_mask,
+                need_cross_weights=return_cross_attentions,
+            )
+            if return_cross_attentions and cross_weights is not None:
+                cross_attentions.append(cross_weights)
+
+        hidden_states = self.final_norm(hidden_states)
+        logits = self.lm_head(hidden_states)
+        loss = None
+        if labels is not None:
+            loss = F.cross_entropy(
+                logits.reshape(-1, self.vocab_size),
+                labels.reshape(-1),
+                ignore_index=-100,
+            )
+        return FactorDecoderOutput(
+            logits=logits,
+            loss=loss,
+            hidden_states=hidden_states,
+            cross_attentions=tuple(cross_attentions),
         )
 
-    def __len__(self) -> int:
-        return len(self.records)
+    @torch.no_grad()
+    def init_token_embedding_from_roberta(self, roberta_path: str | Path) -> None:
+        roberta = AutoModel.from_pretrained(str(Path(roberta_path).expanduser().resolve()), torch_dtype=torch.float32)
+        roberta_embedding = roberta.embeddings.word_embeddings.weight.detach()
+        if roberta_embedding.shape != self.token_embedding.weight.shape:
+            raise ValueError(
+                f"RoBERTa embedding shape {tuple(roberta_embedding.shape)} does not match "
+                f"decoder embedding {tuple(self.token_embedding.weight.shape)}"
+            )
+        with torch.no_grad():
+            self.token_embedding.weight.copy_(roberta_embedding.to(device=self.token_embedding.weight.device, dtype=self.token_embedding.weight.dtype))
+            if self.lm_head.weight is not self.token_embedding.weight:
+                self.lm_head.weight.copy_(roberta_embedding.to(device=self.lm_head.weight.device, dtype=self.lm_head.weight.dtype))
+            if self.pad_token_id is not None:
+                self.token_embedding.weight[self.pad_token_id].zero_()
+        del roberta
 
-    def __getitem__(self, idx: int) -> dict[str, Any]:
-        record = self.records[idx]
-        image_path = self.image_paths[idx]
-        map_path = self.map_paths[idx]
-        index = _safe_int(record.get("index"), idx)
-
-        image = Image.open(image_path).convert("RGB")
-        image_tensor, image_meta = letterbox_resize_to_tensor(
-            image,
-            image_size=self.image_size,
-            normalize=self.normalize_image,
-        )
-
-        pkuseg_factors = clean_factor_list(record.get("pkuseg_factors"))
-        if self.max_pkuseg_factors is not None:
-            pkuseg_factors = pkuseg_factors[: self.max_pkuseg_factors]
-        target_factors = clean_factor_list(record.get("factors"))
-        target_text = factors_to_text(target_factors, output_format=self.output_format)
-
-        map_obj = torch.load(map_path, map_location="cpu") if map_path.exists() else None
-        if map_obj is None:
-            head_saliency = torch.empty(0)
-            mean_saliency = torch.empty(0)
-            map_grid_h = 0
-            map_grid_w = 0
-            selected_heads: list[dict[str, int]] = []
-            map_original_size = image_meta["original_size"]
-            map_input_size = image_meta["original_size"]
-        else:
-            head_saliency = map_obj["head_saliency"].float()
-            mean_saliency = map_obj["mean_saliency"].float()
-            map_grid_h = int(map_obj.get("grid_h", mean_saliency.shape[-2]))
-            map_grid_w = int(map_obj.get("grid_w", mean_saliency.shape[-1]))
-            selected_heads = list(map_obj.get("selected_heads", []))
-            map_original_size = list(map_obj.get("original_image_size", image_meta["original_size"]))
-            map_input_size = list(map_obj.get("input_image_size", map_original_size))
-
-        return {
-            "index": index,
-            "split": self.split,
-            "product_id": str(record.get("product_id", record.get("index", idx))),
-            "title": str(record.get("title", "") or ""),
-            "pkuseg_factors": pkuseg_factors,
-            "image": image_tensor,
-            "image_path": str(image_path),
-            "image_meta": image_meta,
-            "map_path": str(map_path),
-            "head_saliency": head_saliency,
-            "mean_saliency": mean_saliency,
-            "map_grid_h": map_grid_h,
-            "map_grid_w": map_grid_w,
-            "map_original_size": map_original_size,
-            "map_input_size": map_input_size,
-            "selected_heads": selected_heads,
-            "target_factors": target_factors,
-            "target_text": target_text,
-            "keyword": str(record.get("keyword", "") or ""),
-            "brand": str(record.get("brand", "") or ""),
-        }
-
-
-# Backward-compatible alias for earlier imports.
-ProductFactorGenerationDataset = ProductFactorMapDataset
-
-
-def _resize_teacher_maps_direct(
-    maps: list[torch.Tensor],
-    size: tuple[int, int] = (DINO_GRID_SIZE, DINO_GRID_SIZE),
-) -> torch.Tensor:
-    resized = []
-    for m in maps:
-        if m.ndim == 2:
-            x = m.unsqueeze(0).unsqueeze(0)
-            y = F.interpolate(x.float(), size=size, mode="bilinear", align_corners=False).squeeze(0).squeeze(0)
-        elif m.ndim == 3:
-            x = m.unsqueeze(0)
-            y = F.interpolate(x.float(), size=size, mode="bilinear", align_corners=False).squeeze(0)
-        else:
-            raise ValueError(f"Unsupported teacher map shape: {tuple(m.shape)}")
-        resized.append(y.contiguous())
-    return torch.stack(resized, dim=0)
-
-
-def _resize_single_teacher_map_to_dino_letterbox(
-    teacher_map: torch.Tensor,
-    image_meta: dict[str, Any],
-    output_grid: tuple[int, int] = (DINO_GRID_SIZE, DINO_GRID_SIZE),
-) -> torch.Tensor:
-    if teacher_map.numel() == 0:
-        return teacher_map
-    if teacher_map.ndim not in {2, 3}:
-        raise ValueError(f"Unsupported teacher map shape: {tuple(teacher_map.shape)}")
-
-    out_h, out_w = output_grid
-    content_x0, content_y0, content_x1, content_y1 = image_meta["content_box_xyxy"]
-    image_size = int(image_meta["image_size"])
-    gx0 = int(np.floor(content_x0 / image_size * out_w))
-    gy0 = int(np.floor(content_y0 / image_size * out_h))
-    gx1 = int(np.ceil(content_x1 / image_size * out_w))
-    gy1 = int(np.ceil(content_y1 / image_size * out_h))
-    gx0 = max(0, min(out_w - 1, gx0))
-    gy0 = max(0, min(out_h - 1, gy0))
-    gx1 = max(gx0 + 1, min(out_w, gx1))
-    gy1 = max(gy0 + 1, min(out_h, gy1))
-    content_grid_h = gy1 - gy0
-    content_grid_w = gx1 - gx0
-
-    if teacher_map.ndim == 2:
-        x = teacher_map.unsqueeze(0).unsqueeze(0).float()
-        resized = F.interpolate(
-            x,
-            size=(content_grid_h, content_grid_w),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0).squeeze(0)
-        aligned = teacher_map.new_zeros((out_h, out_w), dtype=torch.float32)
-        aligned[gy0:gy1, gx0:gx1] = resized
-    else:
-        x = teacher_map.unsqueeze(0).float()
-        resized = F.interpolate(
-            x,
-            size=(content_grid_h, content_grid_w),
-            mode="bilinear",
-            align_corners=False,
-        ).squeeze(0)
-        aligned = teacher_map.new_zeros((teacher_map.shape[0], out_h, out_w), dtype=torch.float32)
-        aligned[:, gy0:gy1, gx0:gx1] = resized
-    return aligned.contiguous()
-
-
-def _resize_teacher_maps_to_dino_letterbox(
-    maps: list[torch.Tensor],
-    image_metas: list[dict[str, Any]],
-    size: tuple[int, int] = (DINO_GRID_SIZE, DINO_GRID_SIZE),
-) -> torch.Tensor:
-    if len(maps) != len(image_metas):
-        raise ValueError(f"maps/image_metas length mismatch: {len(maps)} vs {len(image_metas)}")
-    return torch.stack(
-        [
-            _resize_single_teacher_map_to_dino_letterbox(m, meta, output_grid=size)
-            for m, meta in zip(maps, image_metas)
-        ],
-        dim=0,
-    )
-
-
-def product_factor_generation_collate_fn(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    """Collate fields and resize teacher maps to the DINO 518px token grid."""
-    images = torch.stack([item["image"] for item in batch], dim=0)
-    image_metas = [item["image_meta"] for item in batch]
-    head_maps = _resize_teacher_maps_to_dino_letterbox(
-        [item["head_saliency"] for item in batch],
-        image_metas,
-    )
-    mean_maps = _resize_teacher_maps_to_dino_letterbox(
-        [item["mean_saliency"] for item in batch],
-        image_metas,
-    )
-
-    return {
-        "index": torch.tensor([item["index"] for item in batch], dtype=torch.long),
-        "split": [item["split"] for item in batch],
-        "product_id": [item["product_id"] for item in batch],
-        "title": [item["title"] for item in batch],
-        "pkuseg_factors": [item["pkuseg_factors"] for item in batch],
-        "image": images,
-        "image_path": [item["image_path"] for item in batch],
-        "image_meta": image_metas,
-        "map_path": [item["map_path"] for item in batch],
-        "head_saliency": head_maps,
-        "mean_saliency": mean_maps,
-        "original_map_grid": torch.tensor(
-            [[item["map_grid_h"], item["map_grid_w"]] for item in batch],
+    @torch.no_grad()
+    def generate(
+        self,
+        encoder_memory: torch.Tensor,
+        bos_token_id: int,
+        eos_token_id: int,
+        max_new_tokens: int = 128,
+        encoder_attention_mask: torch.Tensor | None = None,
+        pad_token_id: int | None = None,
+    ) -> torch.Tensor:
+        self.eval()
+        batch_size = encoder_memory.size(0)
+        input_ids = torch.full(
+            (batch_size, 1),
+            fill_value=bos_token_id,
             dtype=torch.long,
-        ),
-        "selected_heads": [item["selected_heads"] for item in batch],
-        "target_factors": [item["target_factors"] for item in batch],
-        "target_text": [item["target_text"] for item in batch],
-        "keyword": [item["keyword"] for item in batch],
-        "brand": [item["brand"] for item in batch],
-    }
+            device=encoder_memory.device,
+        )
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=encoder_memory.device)
+        encoder_key_padding_mask = None
+        if encoder_attention_mask is not None:
+            encoder_key_padding_mask = ~encoder_attention_mask.bool()
+        past_key_values: list[tuple[torch.Tensor, torch.Tensor] | None] = [None] * len(self.layers)
+        cur_token = input_ids
+        for step in range(max_new_tokens):
+            hidden_states = self.token_embedding(cur_token)
+            hidden_states = self.position_encoding(hidden_states, position_offset=step)
+            hidden_states = self.dropout(hidden_states)
+            new_past_key_values: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for layer_idx, layer in enumerate(self.layers):
+                hidden_states, kv = layer.forward_step(
+                    hidden_states=hidden_states,
+                    encoder_memory=encoder_memory,
+                    past_key_value=past_key_values[layer_idx],
+                    encoder_key_padding_mask=encoder_key_padding_mask,
+                )
+                new_past_key_values.append(kv)
+            past_key_values = new_past_key_values
+            hidden_states = self.final_norm(hidden_states)
+            logits = self.lm_head(hidden_states)
+            next_token = logits[:, -1].argmax(dim=-1)
+            next_token = torch.where(finished, torch.full_like(next_token, eos_token_id), next_token)
+            input_ids = torch.cat([input_ids, next_token[:, None]], dim=1)
+            finished |= next_token.eq(eos_token_id)
+            cur_token = next_token[:, None]
+            if finished.all():
+                break
+        return input_ids
 
 
-def build_dataset(
-    dataset_root: str | Path = DEFAULT_DATASET_ROOT,
-    split: SplitName = "train",
-    image_size: int = DINO_IMAGE_SIZE,
-    output_format: str = "json_array",
-    require_pkuseg_factors: bool = True,
-    require_target_factors: bool = True,
-    require_map: bool = True,
-    max_pkuseg_factors: int | None = None,
-    normalize_image: bool = True,
-) -> ProductFactorMapDataset:
-    return ProductFactorMapDataset(
-        dataset_root=dataset_root,
-        split=split,
-        image_size=image_size,
-        output_format=output_format,
-        require_pkuseg_factors=require_pkuseg_factors,
-        require_target_factors=require_target_factors,
-        require_map=require_map,
-        max_pkuseg_factors=max_pkuseg_factors,
-        normalize_image=normalize_image,
+class FactorDecoderTokenizer:
+    """Tokenizer helper using copied Chinese RoBERTa WordPiece vocabulary."""
+
+    def __init__(self, tokenizer_path: str | Path = DEFAULT_DECODER_TOKENIZER_PATH, max_length: int = 128) -> None:
+        self.tokenizer_path = Path(tokenizer_path).expanduser().resolve()
+        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(str(self.tokenizer_path))
+        self.max_length = int(max_length)
+        self.pad_token_id = int(self.tokenizer.pad_token_id)
+        self.bos_token_id = int(self.tokenizer.cls_token_id)
+        self.eos_token_id = int(self.tokenizer.sep_token_id)
+        self.unk_token_id = int(self.tokenizer.unk_token_id)
+        if self.tokenizer.pad_token != "[PAD]" or self.tokenizer.cls_token != "[CLS]" or self.tokenizer.sep_token != "[SEP]":
+            raise ValueError("Unexpected decoder tokenizer special token mapping")
+
+    @property
+    def vocab_size(self) -> int:
+        return int(self.tokenizer.vocab_size)
+
+    def encode_target_texts(self, target_texts: list[str], device: torch.device | str | None = None) -> FactorDecoderBatch:
+        encoded = self.tokenizer(
+            target_texts,
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,
+            max_length=self.max_length,
+            return_tensors="pt",
+        )
+        ids = encoded["input_ids"]
+        mask = encoded["attention_mask"]
+        if ids.size(1) < 2:
+            raise ValueError("Encoded target sequence must contain at least BOS and EOS tokens")
+
+        input_ids = ids[:, :-1].contiguous()
+        attention_mask = mask[:, :-1].contiguous()
+        labels = ids[:, 1:].contiguous()
+        label_mask = mask[:, 1:].bool()
+        labels = labels.masked_fill(~label_mask, -100)
+        if device is not None:
+            device = torch.device(device)
+            input_ids = input_ids.to(device)
+            attention_mask = attention_mask.to(device)
+            labels = labels.to(device)
+        return FactorDecoderBatch(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            labels=labels,
+            target_text=list(target_texts),
+        )
+
+    def encode_batch_from_dataset(self, batch: dict[str, Any], device: torch.device | str | None = None) -> FactorDecoderBatch:
+        return self.encode_target_texts(list(batch["target_text"]), device=device)
+
+    def decode(self, token_ids: torch.Tensor | list[int], skip_special_tokens: bool = True) -> str:
+        if isinstance(token_ids, torch.Tensor):
+            token_ids = token_ids.detach().cpu().tolist()
+        return self.tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens).strip()
+
+    def decode_batch(self, token_ids: torch.Tensor, skip_special_tokens: bool = True) -> list[str]:
+        return [self.decode(row, skip_special_tokens=skip_special_tokens) for row in token_ids]
+
+    @staticmethod
+    def factors_to_text(factors: list[str]) -> str:
+        return json.dumps(factors, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_factor_decoder(
+    tokenizer_path: str | Path = DEFAULT_DECODER_TOKENIZER_PATH,
+    roberta_path_for_embedding_init: str | Path | None = None,
+    hidden_dim: int = 768,
+    num_layers: int = 12,
+    num_heads: int = 12,
+    ffn_dim: int = 3072,
+    dropout: float = 0.1,
+    max_position_embeddings: int = 512,
+    tie_embedding: bool = True,
+    init_from_roberta: bool = True,
+) -> tuple[FactorAutoregressiveDecoder, FactorDecoderTokenizer]:
+    tok = FactorDecoderTokenizer(tokenizer_path=tokenizer_path, max_length=max_position_embeddings)
+    model = FactorAutoregressiveDecoder(
+        vocab_size=tok.vocab_size,
+        hidden_dim=hidden_dim,
+        num_layers=num_layers,
+        num_heads=num_heads,
+        ffn_dim=ffn_dim,
+        dropout=dropout,
+        max_position_embeddings=max_position_embeddings,
+        pad_token_id=tok.pad_token_id,
+        tie_embedding=tie_embedding,
     )
-
-
-def build_train_dataset(
-    dataset_root: str | Path = DEFAULT_DATASET_ROOT,
-    image_size: int = DINO_IMAGE_SIZE,
-    output_format: str = "json_array",
-    require_pkuseg_factors: bool = True,
-    require_target_factors: bool = True,
-    require_map: bool = True,
-    max_pkuseg_factors: int | None = None,
-    normalize_image: bool = True,
-) -> ProductFactorMapDataset:
-    return build_dataset(
-        dataset_root=dataset_root,
-        split="train",
-        image_size=image_size,
-        output_format=output_format,
-        require_pkuseg_factors=require_pkuseg_factors,
-        require_target_factors=require_target_factors,
-        require_map=require_map,
-        max_pkuseg_factors=max_pkuseg_factors,
-        normalize_image=normalize_image,
-    )
-
-
-def build_test_dataset(
-    dataset_root: str | Path = DEFAULT_DATASET_ROOT,
-    image_size: int = DINO_IMAGE_SIZE,
-    output_format: str = "json_array",
-    require_pkuseg_factors: bool = True,
-    require_target_factors: bool = True,
-    require_map: bool = True,
-    max_pkuseg_factors: int | None = None,
-    normalize_image: bool = True,
-) -> ProductFactorMapDataset:
-    return build_dataset(
-        dataset_root=dataset_root,
-        split="test",
-        image_size=image_size,
-        output_format=output_format,
-        require_pkuseg_factors=require_pkuseg_factors,
-        require_target_factors=require_target_factors,
-        require_map=require_map,
-        max_pkuseg_factors=max_pkuseg_factors,
-        normalize_image=normalize_image,
-    )
-
-
-def build_train_test_datasets(
-    dataset_root: str | Path = DEFAULT_DATASET_ROOT,
-    image_size: int = DINO_IMAGE_SIZE,
-    output_format: str = "json_array",
-    require_pkuseg_factors: bool = True,
-    require_target_factors: bool = True,
-    require_map: bool = True,
-    max_pkuseg_factors: int | None = None,
-    normalize_image: bool = True,
-) -> tuple[ProductFactorMapDataset, ProductFactorMapDataset]:
-    """Explicitly build separated train/test datasets for validation/early stop."""
-    train_dataset = build_train_dataset(
-        dataset_root=dataset_root,
-        image_size=image_size,
-        output_format=output_format,
-        require_pkuseg_factors=require_pkuseg_factors,
-        require_target_factors=require_target_factors,
-        require_map=require_map,
-        max_pkuseg_factors=max_pkuseg_factors,
-        normalize_image=normalize_image,
-    )
-    test_dataset = build_test_dataset(
-        dataset_root=dataset_root,
-        image_size=image_size,
-        output_format=output_format,
-        require_pkuseg_factors=require_pkuseg_factors,
-        require_target_factors=require_target_factors,
-        require_map=require_map,
-        max_pkuseg_factors=max_pkuseg_factors,
-        normalize_image=normalize_image,
-    )
-    return train_dataset, test_dataset
-
-
-def dataset_summary(dataset: ProductFactorMapDataset) -> dict[str, Any]:
-    pkuseg_counts = [len(clean_factor_list(record.get("pkuseg_factors"))) for record in dataset.records]
-    target_counts = [len(clean_factor_list(record.get("factors"))) for record in dataset.records]
-    missing_images = sum(1 for image_path in dataset.image_paths if not image_path.exists())
-    missing_maps = sum(1 for map_path in dataset.map_paths if not map_path.exists())
-    return {
-        "dataset_root": str(dataset.dataset_root),
-        "split": dataset.split,
-        "json_path": str(dataset.json_path),
-        "image_root": str(dataset.image_root),
-        "map_root": str(dataset.map_root),
-        "records": len(dataset),
-        "missing_images": missing_images,
-        "missing_maps": missing_maps,
-        "filtered_counts": dict(dataset.filtered_counts),
-        "avg_pkuseg_factor_count": sum(pkuseg_counts) / len(pkuseg_counts) if pkuseg_counts else 0.0,
-        "max_pkuseg_factor_count": max(pkuseg_counts) if pkuseg_counts else 0,
-        "avg_target_factor_count": sum(target_counts) / len(target_counts) if target_counts else 0.0,
-        "max_target_factor_count": max(target_counts) if target_counts else 0,
-        "max_pkuseg_factors": dataset.max_pkuseg_factors,
-        "image_size": dataset.image_size,
-        "dino_grid_size": DINO_GRID_SIZE,
-        "output_format": dataset.output_format,
-    }
+    if init_from_roberta:
+        roberta_path = Path(roberta_path_for_embedding_init or DEFAULT_ROBERTA_PATH).expanduser().resolve()
+        roberta = AutoModel.from_pretrained(str(roberta_path), torch_dtype=torch.float32)
+        roberta_embedding = roberta.embeddings.word_embeddings.weight.detach()
+        if roberta_embedding.shape != model.token_embedding.weight.shape:
+            raise ValueError(
+                f"RoBERTa embedding shape {tuple(roberta_embedding.shape)} does not match "
+                f"decoder embedding {tuple(model.token_embedding.weight.shape)}"
+            )
+        with torch.no_grad():
+            model.token_embedding.weight.copy_(roberta_embedding)
+            if model.lm_head.weight is not model.token_embedding.weight:
+                model.lm_head.weight.copy_(roberta_embedding)
+        del roberta
+    return model, tok
