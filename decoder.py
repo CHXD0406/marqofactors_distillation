@@ -1,17 +1,5 @@
 #!/usr/bin/env python3
-"""Autoregressive decoder for product factor generation.
 
-The decoder is a standard encoder-decoder Transformer decoder:
-- target tokens use causal self-attention;
-- every layer cross-attends Q-Former memory `[B, M, 768]` as key/value;
-- loss is computed only on answer tokens, with padding labels set to -100.
-
-Tokenizer convention uses the copied Chinese RoBERTa tokenizer:
-- [PAD] -> pad
-- [CLS] -> bos
-- [SEP] -> eos
-- [UNK] -> unk
-"""
 
 from __future__ import annotations
 
