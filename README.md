@@ -9,7 +9,7 @@ Frozen DINOv2 + Frozen Chinese RoBERTa
   → Stage2 Image Grounding Q-Former
   
   → Autoregressive Factor Decoder
- ![Uploading idx2211_scene_gen_grid.jpg…]()
+
 
 imput: demo.jpg  title "2026新款Burberry风衣早秋长款男士外套官方正版英国代购"
 
